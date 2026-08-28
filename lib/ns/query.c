@@ -385,6 +385,9 @@ query_setup(ns_client_t *client, dns_rdatatype_t qtype);
 static isc_result_t
 query_lookup(query_ctx_t *qctx);
 
+static isc_result_t
+query_mapserver(query_ctx_t *qctx);
+
 static void
 fetch_callback(void *arg);
 
@@ -5521,6 +5524,97 @@ stale_client_answer(isc_result_t result) {
 }
 
 /*%
+ * Answer a MAPSERVER query with every MAPSERVER RRset whose owner name is a
+ * suffix of QNAME. This deliberately bypasses ordinary DNS lookup semantics:
+ * delegations, aliases, wildcards, and negative answers do not affect the
+ * suffix search.
+ */
+static isc_result_t
+query_mapserver(query_ctx_t *qctx) {
+	ns_client_t *client = qctx->client;
+	const dns_name_t *origin = dns_db_origin(qctx->db);
+	const dns_name_t *qname = client->query.qname;
+	dns_dbnode_t *node = NULL;
+	dns_name_t *answername = NULL;
+	dns_rdataset_t *rdataset = NULL;
+	isc_result_t result = ISC_R_SUCCESS;
+	unsigned int labels;
+	unsigned int originlabels;
+	unsigned int qlabels;
+
+	CCTRACE(ISC_LOG_DEBUG(3), "query_mapserver");
+	client->query.secure = false;
+	client->message->flags &= ~DNS_MESSAGEFLAG_AD;
+
+	if (!dns_name_issubdomain(qname, origin)) {
+		return ns_query_done(qctx);
+	}
+
+	qlabels = dns_name_countlabels(qname);
+	originlabels = dns_name_countlabels(origin);
+
+	/* Search from the least specific suffix through the full QNAME. */
+	for (labels = originlabels; labels <= qlabels; labels++) {
+		dns_fixedname_t candidatefixed;
+		dns_name_t *candidate =
+			dns_fixedname_initname(&candidatefixed);
+
+		dns_name_getlabelsequence(qname, qlabels - labels, labels,
+					  candidate);
+
+		result = dns_db_findnode(qctx->db, candidate, false, &node);
+		if (result == ISC_R_NOTFOUND) {
+			continue;
+		}
+		if (result != ISC_R_SUCCESS) {
+			QUERY_ERROR(qctx, result);
+			goto cleanup;
+		}
+
+		rdataset = ns_client_newrdataset(client);
+		result = dns_db_findrdataset(
+			qctx->db, node, qctx->version, dns_rdatatype_mapserver, 0,
+			client->inner.now, rdataset, NULL);
+		dns_db_detachnode(&node);
+
+		if (result == ISC_R_NOTFOUND) {
+			ns_client_putrdataset(client, &rdataset);
+			continue;
+		}
+		if (result != ISC_R_SUCCESS) {
+			QUERY_ERROR(qctx, result);
+			goto cleanup;
+		}
+
+		dns_message_gettempname(client->message, &answername);
+		dns_name_clone(candidate, answername);
+		query_addrrset(qctx, &answername, &rdataset, NULL, NULL,
+			       DNS_SECTION_ANSWER);
+
+		if (answername != NULL) {
+			dns_message_puttempname(client->message, &answername);
+		}
+		if (rdataset != NULL) {
+			ns_client_putrdataset(client, &rdataset);
+		}
+	}
+
+	return ns_query_done(qctx);
+
+cleanup:
+	if (node != NULL) {
+		dns_db_detachnode(&node);
+	}
+	if (answername != NULL) {
+		dns_message_puttempname(client->message, &answername);
+	}
+	if (rdataset != NULL) {
+		ns_client_putrdataset(client, &rdataset);
+	}
+	return ns_query_done(qctx);
+}
+
+/*%
  * Perform a local database lookup, in either an authoritative or
  * cache database. If unable to answer, call ns_query_done(); otherwise
  * hand off processing to query_gotanswer().
@@ -5548,6 +5642,10 @@ query_lookup(query_ctx_t *qctx) {
 	CCTRACE(ISC_LOG_DEBUG(3), "query_lookup");
 
 	CALL_HOOK(NS_QUERY_LOOKUP_BEGIN, qctx);
+
+	if (qctx->is_zone && qctx->qtype == dns_rdatatype_mapserver) {
+		return query_mapserver(qctx);
+	}
 
 	dns_clientinfomethods_init(&cm, ns_client_sourceip);
 	dns_clientinfo_init(&ci, qctx->client, NULL);
