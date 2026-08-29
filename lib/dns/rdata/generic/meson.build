@@ -72,6 +72,8 @@ dns_header_depfiles += files(
     'lp_107.h',
     'mapserver_65280.c',
     'mapserver_65280.h',
+    'mapzone_65281.c',
+    'mapzone_65281.h',
     'mb_7.c',
     'mb_7.h',
     'md_3.c',

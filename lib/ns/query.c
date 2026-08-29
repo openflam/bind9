@@ -386,7 +386,7 @@ static isc_result_t
 query_lookup(query_ctx_t *qctx);
 
 static isc_result_t
-query_mapserver(query_ctx_t *qctx);
+query_maprecords(query_ctx_t *qctx);
 
 static void
 fetch_callback(void *arg);
@@ -5524,16 +5524,18 @@ stale_client_answer(isc_result_t result) {
 }
 
 /*%
- * Answer a MAPSERVER query with every MAPSERVER RRset whose owner name is a
- * suffix of QNAME. This deliberately bypasses ordinary DNS lookup semantics:
- * delegations, aliases, wildcards, and negative answers do not affect the
- * suffix search.
+ * Answer MAPSERVER and MAPZONE queries using their custom suffix semantics.
+ * MAPZONE queries return every matching MAPZONE RRset. MAPSERVER queries
+ * return every matching MAPSERVER and MAPZONE RRset. This deliberately
+ * bypasses ordinary DNS lookup semantics: delegations, aliases, wildcards,
+ * and negative answers do not affect the suffix search.
  */
 static isc_result_t
-query_mapserver(query_ctx_t *qctx) {
+query_maprecords(query_ctx_t *qctx) {
 	ns_client_t *client = qctx->client;
 	const dns_name_t *origin = dns_db_origin(qctx->db);
 	const dns_name_t *qname = client->query.qname;
+	dns_rdatatype_t types[2] = { qctx->qtype, 0 };
 	dns_dbnode_t *node = NULL;
 	dns_name_t *answername = NULL;
 	dns_rdataset_t *rdataset = NULL;
@@ -5541,8 +5543,17 @@ query_mapserver(query_ctx_t *qctx) {
 	unsigned int labels;
 	unsigned int originlabels;
 	unsigned int qlabels;
+	size_t typecount = 1;
+	size_t typeindex;
 
-	CCTRACE(ISC_LOG_DEBUG(3), "query_mapserver");
+	CCTRACE(ISC_LOG_DEBUG(3), "query_maprecords");
+	REQUIRE(qctx->qtype == dns_rdatatype_mapserver ||
+		qctx->qtype == dns_rdatatype_mapzone);
+
+	if (qctx->qtype == dns_rdatatype_mapserver) {
+		types[typecount++] = dns_rdatatype_mapzone;
+	}
+
 	client->query.secure = false;
 	client->message->flags &= ~DNS_MESSAGEFLAG_AD;
 
@@ -5571,32 +5582,35 @@ query_mapserver(query_ctx_t *qctx) {
 			goto cleanup;
 		}
 
-		rdataset = ns_client_newrdataset(client);
-		result = dns_db_findrdataset(
-			qctx->db, node, qctx->version, dns_rdatatype_mapserver, 0,
-			client->inner.now, rdataset, NULL);
+		for (typeindex = 0; typeindex < typecount; typeindex++) {
+			rdataset = ns_client_newrdataset(client);
+			result = dns_db_findrdataset(
+				qctx->db, node, qctx->version, types[typeindex], 0,
+				client->inner.now, rdataset, NULL);
+
+			if (result == ISC_R_NOTFOUND) {
+				ns_client_putrdataset(client, &rdataset);
+				continue;
+			}
+			if (result != ISC_R_SUCCESS) {
+				QUERY_ERROR(qctx, result);
+				goto cleanup;
+			}
+
+			dns_message_gettempname(client->message, &answername);
+			dns_name_clone(candidate, answername);
+			query_addrrset(qctx, &answername, &rdataset, NULL, NULL,
+				       DNS_SECTION_ANSWER);
+
+			if (answername != NULL) {
+				dns_message_puttempname(client->message,
+						    &answername);
+			}
+			if (rdataset != NULL) {
+				ns_client_putrdataset(client, &rdataset);
+			}
+		}
 		dns_db_detachnode(&node);
-
-		if (result == ISC_R_NOTFOUND) {
-			ns_client_putrdataset(client, &rdataset);
-			continue;
-		}
-		if (result != ISC_R_SUCCESS) {
-			QUERY_ERROR(qctx, result);
-			goto cleanup;
-		}
-
-		dns_message_gettempname(client->message, &answername);
-		dns_name_clone(candidate, answername);
-		query_addrrset(qctx, &answername, &rdataset, NULL, NULL,
-			       DNS_SECTION_ANSWER);
-
-		if (answername != NULL) {
-			dns_message_puttempname(client->message, &answername);
-		}
-		if (rdataset != NULL) {
-			ns_client_putrdataset(client, &rdataset);
-		}
 	}
 
 	return ns_query_done(qctx);
@@ -5643,8 +5657,11 @@ query_lookup(query_ctx_t *qctx) {
 
 	CALL_HOOK(NS_QUERY_LOOKUP_BEGIN, qctx);
 
-	if (qctx->is_zone && qctx->qtype == dns_rdatatype_mapserver) {
-		return query_mapserver(qctx);
+	if (qctx->is_zone &&
+	    (qctx->qtype == dns_rdatatype_mapserver ||
+	     qctx->qtype == dns_rdatatype_mapzone))
+	{
+		return query_maprecords(qctx);
 	}
 
 	dns_clientinfomethods_init(&cm, ns_client_sourceip);
